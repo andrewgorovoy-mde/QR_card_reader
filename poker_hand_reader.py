@@ -349,6 +349,16 @@ class PokerHandReader:
             ConsoleFormatter.reset("Resetting empty hand.")
         self.current_cards.clear()
         self.card_count = 0  # Reset card counter
+        
+        # Send reset command to Arduino
+        if self.serial is not None:
+            try:
+                self.serial.write(b"R\n")
+                self.serial.flush()
+                ConsoleFormatter.info("Sent reset command 'R' to Arduino", indent=3)
+            except Exception as e:
+                ConsoleFormatter.error(f"Error sending reset to Arduino: {e}", indent=3)
+        
         ConsoleFormatter.info("Ready for new cards.", indent=3)
         print()
     
