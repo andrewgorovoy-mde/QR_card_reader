@@ -29,6 +29,66 @@ def is_raspberry_pi():
 IS_RASPBERRY_PI = is_raspberry_pi()
 DISPLAY_AVAILABLE = os.environ.get('DISPLAY') is not None
 
+# Console formatting helpers for uniform output
+class ConsoleFormatter:
+    """Uniform console output formatting."""
+    
+    WIDTH = 70
+    PREFIX_INFO = "ℹ️  "
+    PREFIX_SUCCESS = "✓ "
+    PREFIX_ERROR = "✗ "
+    PREFIX_WARNING = "⚠️  "
+    PREFIX_CARD = "🎴 "
+    PREFIX_FLOP = "🎰 "
+    PREFIX_TURN = "🔄 "
+    PREFIX_RIVER = "🌊 "
+    PREFIX_HAND = "🃏 "
+    
+    @staticmethod
+    def header(title: str, emoji: str = ""):
+        """Print a formatted header."""
+        print("\n" + "=" * ConsoleFormatter.WIDTH)
+        if emoji:
+            print(f"{emoji} {title}")
+        else:
+            print(title)
+        print("=" * ConsoleFormatter.WIDTH)
+    
+    @staticmethod
+    def info(msg: str, indent: int = 0):
+        """Print an info message."""
+        spaces = " " * indent
+        print(f"{spaces}{ConsoleFormatter.PREFIX_INFO}{msg}")
+    
+    @staticmethod
+    def success(msg: str, indent: int = 0):
+        """Print a success message."""
+        spaces = " " * indent
+        print(f"{spaces}{ConsoleFormatter.PREFIX_SUCCESS}{msg}")
+    
+    @staticmethod
+    def error(msg: str, indent: int = 0):
+        """Print an error message."""
+        spaces = " " * indent
+        print(f"{spaces}{ConsoleFormatter.PREFIX_ERROR}{msg}")
+    
+    @staticmethod
+    def warning(msg: str, indent: int = 0):
+        """Print a warning message."""
+        spaces = " " * indent
+        print(f"{spaces}{ConsoleFormatter.PREFIX_WARNING}{msg}")
+    
+    @staticmethod
+    def separator():
+        """Print a separator line."""
+        print("-" * ConsoleFormatter.WIDTH)
+    
+    @staticmethod
+    def bullet(msg: str, indent: int = 2):
+        """Print a bullet point."""
+        spaces = " " * indent
+        print(f"{spaces}• {msg}")
+
 try:
     import cv2
 except ImportError:
@@ -430,7 +490,7 @@ def main():
                         1,
                     )
 
-                    print(f"QR Code detected: {formatted_data}")
+                    ConsoleFormatter.info(f"QR Code detected: {formatted_data}")
 
             # --------- Poker logic with stable ordering  --------- #
             # Add newly seen QR codes to both the set and the ordered list
@@ -446,43 +506,39 @@ def main():
             if current_count >= 3 and not flop_detected:
                 flop_cards = card_order[:3]
                 flop_detected = True
-                print("\n" + "=" * 60)
-                print("🎰 FLOP DETECTED! 🎰")
-                print("=" * 60)
-                print(f"Card 1: {flop_cards[0]}")
-                print(f"Card 2: {flop_cards[1]}")
-                print(f"Card 3: {flop_cards[2]}")
-                print("=" * 60 + "\n")
+                ConsoleFormatter.header("FLOP DETECTED!", "🎰")
+                ConsoleFormatter.info(f"Card 1: {flop_cards[0]}", indent=3)
+                ConsoleFormatter.info(f"Card 2: {flop_cards[1]}", indent=3)
+                ConsoleFormatter.info(f"Card 3: {flop_cards[2]}", indent=3)
+                ConsoleFormatter.separator()
+                print()
 
             # TURN: 4th card in detection order
             if current_count >= 4 and not turn_detected:
                 turn_card = card_order[3]
                 turn_detected = True
-                print("\n" + "=" * 60)
-                print("🔄 TURN DETECTED! 🔄")
-                print("=" * 60)
-                print(f"Turn Card: {turn_card}")
-                print("=" * 60 + "\n")
+                ConsoleFormatter.header("TURN DETECTED!", "🔄")
+                ConsoleFormatter.info(f"Turn Card: {turn_card}", indent=3)
+                ConsoleFormatter.separator()
+                print()
 
             # RIVER: 5th card in detection order
             if current_count >= 5 and not river_detected:
                 river_card = card_order[4]
                 river_detected = True
-                print("\n" + "=" * 60)
-                print("🌊 RIVER DETECTED! 🌊")
-                print("=" * 60)
-                print(f"River Card: {river_card}")
-                print("=" * 60 + "\n")
+                ConsoleFormatter.header("RIVER DETECTED!", "🌊")
+                ConsoleFormatter.info(f"River Card: {river_card}", indent=3)
+                ConsoleFormatter.separator()
+                print()
 
-                print("\n" + "=" * 60)
-                print("🃏 COMPLETE HAND SUMMARY 🃏")
-                print("=" * 60)
-                print("Flop:")
+                ConsoleFormatter.header("COMPLETE HAND SUMMARY", "🃏")
+                ConsoleFormatter.info("Flop:", indent=3)
                 for i, card in enumerate(flop_cards, 1):
-                    print(f"  Card {i}: {card}")
-                print(f"Turn:  {turn_card}")
-                print(f"River: {river_card}")
-                print("=" * 60 + "\n")
+                    ConsoleFormatter.info(f"Card {i}: {card}", indent=5)
+                ConsoleFormatter.info(f"Turn:  {turn_card}", indent=3)
+                ConsoleFormatter.info(f"River: {river_card}", indent=3)
+                ConsoleFormatter.separator()
+                print()
 
             # ----------------------------------------------------- #
 
@@ -712,18 +768,18 @@ def main():
                 turn_card = None
                 river_detected = False
                 river_card = None
-                print("\n" + "=" * 60)
-                print("🔄 HAND RESET 🔄")
-                print("=" * 60)
-                print("All cards cleared. Ready to detect a new hand...")
-                print("=" * 60 + "\n")
+                ConsoleFormatter.header("HAND RESET", "🔄")
+                ConsoleFormatter.info("All cards cleared. Ready to detect a new hand...", indent=3)
+                ConsoleFormatter.separator()
+                print()
             elif key == ord("1"):
-                print("\nKnown cards so far:")
+                print()
+                ConsoleFormatter.info("Known cards so far:")
                 if not card_order:
-                    print("  (none yet)")
+                    ConsoleFormatter.info("(none yet)", indent=3)
                 else:
                     for i, card in enumerate(card_order, 1):
-                        print(f"  {i}. {card}")
+                        ConsoleFormatter.info(f"{i}. {card}", indent=3)
                 print()
                 # Play audio for all known cards
                 play_cards_audio(card_order)

@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
 """
-Poker Hand Reader Script
+Poker Hand Reader Script (Pi/Mac side, with Arduino serial I/O)
 
 Reads poker card input from a USB QR code reader (which acts as a keyboard).
 Once two unique cards are detected, stores the hand.
-Press 'R' to reset the hand.
+
+Also sends messages to an Arduino over serial:
+  - CARD:<card>  (e.g. CARD:AS)
+  - HAND:<cards> (e.g. HAND:AS,7H)
+  - RESET
+
+And reads any Serial.println() output from the Arduino and prints it
+to this console with a [ARDUINO] prefix.
+
+Controls:
+  R - Reset current hand (without storing)
+  S - Show status
+  Q - Quit
 """
 
 import sys
@@ -12,7 +24,129 @@ import re
 import tty
 import termios
 import select
-from typing import Set, List, Optional
+import time
+import platform
+import argparse
+from typing import List, Optional
+
+# Try to import pyserial
+try:
+    import serial
+    HAVE_SERIAL = True
+except ImportError:
+    serial = None
+    HAVE_SERIAL = False
+
+# --- Default serial ports for different OSes ---
+
+SYSTEM = platform.system()  # 'Darwin' for macOS, 'Linux' for Pi
+
+if SYSTEM == "Darwin":
+    # For your MKR WiFi 1010 on macOS
+    DEFAULT_SERIAL_PORT = "/dev/cu.usbmodem1101"
+elif SYSTEM == "Linux":
+    # Typical Arduino device name on Raspberry Pi
+    DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
+else:
+    DEFAULT_SERIAL_PORT = ""  # unknown OS, must pass --serial-port
+
+DEFAULT_BAUDRATE = 115200  # MKR WiFi 1010 is fine with 115200
+
+# Console formatting helpers for uniform output
+class ConsoleFormatter:
+    """Uniform console output formatting."""
+    
+    WIDTH = 70
+    PREFIX_INFO = "ℹ️  "
+    PREFIX_SUCCESS = "✓ "
+    PREFIX_ERROR = "✗ "
+    PREFIX_WARNING = "⚠️  "
+    PREFIX_CARD = "🎴 "
+    PREFIX_RESET = "🔄 "
+    PREFIX_STATUS = "📊 "
+    PREFIX_HISTORY = "📚 "
+    PREFIX_INPUT = "📥 "
+    PREFIX_ARDUINO = "[ARDUINO]"
+    
+    @staticmethod
+    def header(title: str, emoji: str = ""):
+        """Print a formatted header."""
+        print("\n" + "=" * ConsoleFormatter.WIDTH)
+        if emoji:
+            print(f"{emoji} {title}")
+        else:
+            print(title)
+        print("=" * ConsoleFormatter.WIDTH)
+    
+    @staticmethod
+    def info(msg: str, indent: int = 0):
+        """Print an info message."""
+        spaces = " " * indent
+        print(f"{spaces}{ConsoleFormatter.PREFIX_INFO}{msg}")
+    
+    @staticmethod
+    def success(msg: str, indent: int = 0):
+        """Print a success message."""
+        spaces = " " * indent
+        print(f"{spaces}{ConsoleFormatter.PREFIX_SUCCESS}{msg}")
+    
+    @staticmethod
+    def error(msg: str, indent: int = 0):
+        """Print an error message."""
+        spaces = " " * indent
+        print(f"{spaces}{ConsoleFormatter.PREFIX_ERROR}{msg}")
+    
+    @staticmethod
+    def warning(msg: str, indent: int = 0):
+        """Print a warning message."""
+        spaces = " " * indent
+        print(f"{spaces}{ConsoleFormatter.PREFIX_WARNING}{msg}")
+    
+    @staticmethod
+    def card(msg: str, indent: int = 0):
+        """Print a card-related message."""
+        spaces = " " * indent
+        print(f"{spaces}{ConsoleFormatter.PREFIX_CARD}{msg}")
+    
+    @staticmethod
+    def reset(msg: str, indent: int = 0):
+        """Print a reset-related message."""
+        spaces = " " * indent
+        print(f"\n{spaces}{ConsoleFormatter.PREFIX_RESET}{msg}")
+    
+    @staticmethod
+    def status(msg: str, indent: int = 0):
+        """Print a status message."""
+        spaces = " " * indent
+        print(f"\n{spaces}{ConsoleFormatter.PREFIX_STATUS}{msg}")
+    
+    @staticmethod
+    def history(msg: str, indent: int = 0):
+        """Print a history message."""
+        spaces = " " * indent
+        print(f"{spaces}{ConsoleFormatter.PREFIX_HISTORY}{msg}")
+    
+    @staticmethod
+    def input_msg(msg: str, indent: int = 0):
+        """Print an input-related message."""
+        spaces = " " * indent
+        print(f"{spaces}{ConsoleFormatter.PREFIX_INPUT}{msg}")
+    
+    @staticmethod
+    def arduino(msg: str):
+        """Print an Arduino message."""
+        print(f"\n{ConsoleFormatter.PREFIX_ARDUINO} {msg}")
+    
+    @staticmethod
+    def separator():
+        """Print a separator line."""
+        print("-" * ConsoleFormatter.WIDTH)
+    
+    @staticmethod
+    def bullet(msg: str, indent: int = 2):
+        """Print a bullet point."""
+        spaces = " " * indent
+        print(f"{spaces}• {msg}")
 
 
 class PokerHandReader:
@@ -30,11 +164,89 @@ class PokerHandReader:
         'AC', '2C', '3C', '4C', '5C', '6C', '7C', '8C', '9C', '10C', 'JC', 'QC', 'KC'
     }
     
-    def __init__(self):
+    def __init__(self, serial_conn=None):
         """Initialize the poker hand reader."""
-        self.current_hand: Set[str] = set()  # Use set to automatically handle duplicates
-        self.hand_history: List[List[str]] = []  # Store completed hands
+        self.current_cards: List[str] = []         # Only keep 2 most recent cards
+        self.card_count: int = 0                   # Total number of cards seen
+        self.serial = serial_conn                  # Serial connection to Arduino (or None)
+    
+    def card_to_list(self, card: str) -> List[str]:
+        """
+        Convert a card string to Arduino list format.
         
+        Format: [face_value, number_value, suit]
+        - face_value: N (not face), J, Q, K, A
+        - number_value: B (blank if face card), 1-9 (number, 10 becomes 1)
+        - suit: D, S, C, H
+        
+        Args:
+            card: Card string like "AS", "7H", "10D", "KH"
+            
+        Returns:
+            List of 3 elements [face, number, suit]
+        """
+        rank = card[:-1]  # Everything except last character (suit)
+        suit = card[-1]   # Last character (suit)
+        
+        # Map suit
+        suit_map = {'D': 'D', 'S': 'S', 'C': 'C', 'H': 'H'}
+        suit_char = suit_map.get(suit, 'D')
+        
+        # Determine face card and number
+        if rank == 'A':
+            return ['A', 'B', suit_char]
+        elif rank == 'J':
+            return ['J', 'B', suit_char]
+        elif rank == 'Q':
+            return ['Q', 'B', suit_char]
+        elif rank == 'K':
+            return ['K', 'B', suit_char]
+        elif rank == '10':
+            return ['N', '1', suit_char]  # 10 becomes 1
+        else:
+            # Number card (2-9)
+            return ['N', rank, suit_char]
+    
+    def send_hand_to_arduino(self, cards: List[str]):
+        """
+        Send a hand (2 cards) to Arduino as a flat list of 6 elements.
+        
+        Format: [card1_face, card1_number, card1_suit, card2_face, card2_number, card2_suit]
+        
+        Args:
+            cards: List of 2 card strings (e.g., ["AS", "7H"])
+        """
+        if self.serial is None:
+            ConsoleFormatter.warning("Cannot send to Arduino: serial connection is None", indent=3)
+            return
+        
+        if len(cards) != 2:
+            ConsoleFormatter.error(f"Cannot send to Arduino: expected 2 cards, got {len(cards)}", indent=3)
+            return
+        
+        try:
+            # Convert both cards to list format
+            card1_list = self.card_to_list(cards[0])
+            card2_list = self.card_to_list(cards[1])
+            
+            # Flatten into single list of 6 elements
+            hand_list = card1_list + card2_list
+            
+            # Convert to string format for Arduino
+            # Format: HAND:A,B,S,N,7,H
+            hand_str = ",".join(hand_list)
+            message = f"HAND:{hand_str}\n"
+            
+            self.serial.write(message.encode("ascii", errors="ignore"))
+            self.serial.flush()
+            
+            ConsoleFormatter.success(f"Sent to Arduino: HAND:{hand_str.strip()}", indent=3)
+            ConsoleFormatter.info(f"Data: {hand_list}", indent=5)
+        except Exception as e:
+            ConsoleFormatter.error(f"Error sending to Arduino: {e}", indent=3)
+            import traceback
+            ConsoleFormatter.error(f"Traceback: {traceback.format_exc()}", indent=5)
+    
     def validate_card(self, input_str: str) -> Optional[str]:
         """
         Validate a card against the 52 valid poker cards.
@@ -63,7 +275,9 @@ class PokerHandReader:
     
     def add_card(self, card: str) -> bool:
         """
-        Add a card to the current hand if it's unique.
+        Add a card, keeping only the 2 most recent cards.
+        Send to Arduino only when we have 2 cards AND it's an even-numbered card (2nd, 4th, 6th, etc.).
+        Duplicate cards are rejected and will not be sent.
         
         Args:
             card: Normalized card string
@@ -71,57 +285,84 @@ class PokerHandReader:
         Returns:
             True if card was added, False if duplicate
         """
-        if card in self.current_hand:
-            print(f"  ⚠️  Duplicate card: {card}")
+        # Check for duplicate - if card already exists in current cards, reject it
+        if card in self.current_cards:
+            ConsoleFormatter.warning(f"Duplicate card rejected: {card}", indent=2)
+            ConsoleFormatter.info(f"Current cards: {self.current_cards}, Count: {self.card_count} (unchanged)", indent=3)
             return False
         
-        self.current_hand.add(card)
-        print(f"  ✓ Card added: {card}")
+        # Increment card count
+        self.card_count += 1
+        
+        # Add the new card
+        self.current_cards.append(card)
+        
+        # Keep only the 2 most recent cards
+        if len(self.current_cards) > 2:
+            self.current_cards.pop(0)
+        
+        ConsoleFormatter.success(f"Card {self.card_count} added: {card}", indent=2)
+        ConsoleFormatter.info(f"Current cards: {self.current_cards}, Count: {self.card_count}", indent=3)
+        
+        # Send to Arduino only when we have 2 cards AND it's an even-numbered card (2nd, 4th, 6th, etc.)
+        if len(self.current_cards) == 2 and self.card_count % 2 == 0:
+            ConsoleFormatter.info(f"Sending pair to Arduino (card_count={self.card_count} is even)", indent=3)
+            self.send_hand_to_arduino(self.current_cards)
+        elif len(self.current_cards) == 2:
+            ConsoleFormatter.info(f"Have 2 cards but waiting (card_count={self.card_count} is odd)", indent=3)
+        
         return True
     
     def get_hand(self) -> List[str]:
         """
-        Get current hand as sorted list.
+        Get current cards (up to 2 most recent).
         
         Returns:
-            List of cards in current hand, sorted
+            List of current cards
         """
-        return sorted(list(self.current_hand))
+        return self.current_cards.copy()
     
     def store_hand(self):
-        """Store the current hand in history and clear it."""
-        if len(self.current_hand) >= 2:
+        """Store and clear the current hand."""
+        if len(self.current_cards) >= 2:
             hand = self.get_hand()
-            self.hand_history.append(hand.copy())
-            print(f"\n🎴 Hand stored: {', '.join(hand)}")
-            print(f"   Total hands stored: {len(self.hand_history)}")
+            ConsoleFormatter.card(f"Hand stored: {', '.join(hand)}")
+            
+            # Send hand to Arduino in list format (only when we have 2 cards)
+            if len(hand) == 2:
+                self.send_hand_to_arduino(hand)
         else:
-            print(f"\n⚠️  Hand has only {len(self.current_hand)} card(s). Need at least 2 cards to store.")
+            ConsoleFormatter.warning(
+                f"Hand has only {len(self.current_cards)} card(s). "
+                f"Need at least 2 cards to store."
+            )
         
-        self.current_hand.clear()
-        print("   Hand reset. Ready for new cards.\n")
+        self.current_cards.clear()
+        ConsoleFormatter.info("Hand reset. Ready for new cards.", indent=3)
+        print()
     
     def reset(self):
         """Reset the current hand without storing it."""
-        if self.current_hand:
-            print(f"\n🔄 Resetting hand: {', '.join(self.get_hand())}")
+        if self.current_cards:
+            ConsoleFormatter.reset(f"Resetting hand: {', '.join(self.get_hand())}")
         else:
-            print("\n🔄 Resetting empty hand.")
-        self.current_hand.clear()
-        print("   Ready for new cards.\n")
+            ConsoleFormatter.reset("Resetting empty hand.")
+        self.current_cards.clear()
+        self.card_count = 0  # Reset card counter
+        ConsoleFormatter.info("Ready for new cards.", indent=3)
+        print()
     
     def display_status(self):
         """Display current status."""
-        if self.current_hand:
-            print(f"\n📊 Current hand ({len(self.current_hand)} card(s)): {', '.join(self.get_hand())}")
-            if len(self.current_hand) >= 2:
-                print("   ✓ Hand complete! Will be stored on next card or reset.")
-        else:
-            print("\n📊 No cards in current hand.")
-        
-        if self.hand_history:
-            print(f"📚 Total hands stored: {len(self.hand_history)}")
-            print(f"   Last hand: {', '.join(self.hand_history[-1])}")
+        ConsoleFormatter.separator()
+        if self.current_cards:
+            ConsoleFormatter.status(
+                f"Current cards ({len(self.current_cards)} card(s)): "
+                f"{', '.join(self.get_hand())}"
+            )
+            if len(self.current_cards) >= 2:
+                ConsoleFormatter.success("Hand complete! Will be stored on next card or reset.", indent=3)
+        ConsoleFormatter.separator()
 
 
 def get_char(timeout=0.1):
@@ -141,33 +382,96 @@ def get_char(timeout=0.1):
 
 def main():
     """Main function to run the poker hand reader."""
-    reader = PokerHandReader()
+    parser = argparse.ArgumentParser(description="Poker Hand Reader with Arduino output")
+    parser.add_argument(
+        "--serial-port",
+        default=DEFAULT_SERIAL_PORT,
+        help=f"Serial port for Arduino "
+             f"(default: '{DEFAULT_SERIAL_PORT or 'NONE'}' for {SYSTEM})",
+    )
+    parser.add_argument(
+        "--baudrate",
+        type=int,
+        default=DEFAULT_BAUDRATE,
+        help=f"Serial baudrate (default: {DEFAULT_BAUDRATE})",
+    )
+    args = parser.parse_args()
+
+    # Try to open serial connection to Arduino
+    ser = None
+    if not HAVE_SERIAL:
+        ConsoleFormatter.warning(
+            "pyserial not installed. Run 'pip install pyserial' to enable Arduino serial output."
+        )
+    elif not args.serial_port:
+        ConsoleFormatter.warning(
+            "No default serial port for this OS. Use --serial-port to specify one."
+        )
+    else:
+        try:
+            ConsoleFormatter.info(f"Opening serial port {args.serial_port} at {args.baudrate} baud...")
+            # small timeout so .readline() won't block forever
+            ser = serial.Serial(args.serial_port, args.baudrate, timeout=0.1)
+            # Wait a bit for Arduino to reboot when serial opens
+            time.sleep(2)
+            ConsoleFormatter.success(
+                f"Connected to Arduino on {args.serial_port} at {args.baudrate} baud"
+            )
+        except Exception as e:
+            ConsoleFormatter.warning(f"Could not open serial port {args.serial_port}: {e}")
+            ConsoleFormatter.info("Continuing WITHOUT Arduino connection.", indent=3)
+            print()
+            ser = None
+    
+    reader = PokerHandReader(serial_conn=ser)
     
     # Save terminal settings
-    old_settings = termios.tcgetattr(sys.stdin)
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
     
-    print("=" * 60)
-    print("🎴 Poker Hand Reader")
-    print("=" * 60)
+    ConsoleFormatter.header("Poker Hand Reader", "🎴")
     print("\nInstructions:")
-    print("  • Scan QR codes with poker cards (e.g., 'AS', 'KH', '2C')")
-    print("  • Cards are processed automatically when 2-3 characters are entered")
-    print("  • Once 2 unique cards are detected, hand will be stored")
-    print("  • Press 'R' to reset current hand")
-    print("  • Press 'Q' to quit")
-    print("  • Press 'S' to show status")
-    print("\n📥 Reading character-by-character input from QR code reader...")
-    print("   (No Enter key needed - cards processed automatically)\n")
+    ConsoleFormatter.bullet("Scan QR codes with poker cards (e.g., 'AS', 'KH', '2C')")
+    ConsoleFormatter.bullet("Cards are processed automatically when 2–3 characters are entered")
+    ConsoleFormatter.bullet("Once 2 unique cards are detected, hand will be stored")
+    ConsoleFormatter.bullet("Press 'R' to reset current hand")
+    ConsoleFormatter.bullet("Press 'Q' to quit")
+    ConsoleFormatter.bullet("Press 'S' to show status")
+    print()
+    ConsoleFormatter.input_msg("Reading character-by-character input from QR code reader...")
+    ConsoleFormatter.info("No Enter key needed - cards processed automatically", indent=3)
+    if ser is not None:
+        ConsoleFormatter.info("Arduino output will appear prefixed as [ARDUINO] ...", indent=3)
+    print()
     
     try:
         # Set terminal to raw mode for character-by-character input
-        tty.setraw(sys.stdin.fileno())
+        tty.setraw(fd)
         
         input_buffer = ""
         
+        # Flush any buffered input before starting
+        # Small delay to let terminal settle after raw mode
+        time.sleep(0.1)
+        
+        # Drain any buffered input
+        while select.select([sys.stdin], [], [], 0)[0]:
+            try:
+                sys.stdin.read(1)
+            except:
+                break
+        
         while True:
             try:
-                # Read a single character
+                # --- NEW: show anything the Arduino prints ---
+                if ser is not None:
+                    # Drain all waiting lines so we don't fall behind
+                    while ser.in_waiting:
+                        line = ser.readline().decode("utf-8", errors="replace").rstrip()
+                        if line:
+                            ConsoleFormatter.arduino(line)
+                
+                # --- existing QR scanner input handling ---
                 char = get_char(timeout=0.1)
                 
                 if char is None:
@@ -177,27 +481,34 @@ def main():
                         card = reader.validate_card(input_buffer)
                         
                         if card:
-                            print(f"📥 Processed: '{input_buffer}' -> {card}")
+                            ConsoleFormatter.input_msg(f"Processed: '{input_buffer}' -> {card}")
                             reader.add_card(card)
                             
-                            # Check if we have at least 2 unique cards - store automatically
-                            if len(reader.current_hand) >= 2:
-                                print(f"\n✅ Hand complete! ({len(reader.current_hand)} unique cards)")
-                                print(f"   Hand: {', '.join(reader.get_hand())}")
-                                reader.store_hand()
+                            # If at least 2 cards, hand is automatically sent to Arduino
+                            if len(reader.current_cards) >= 2:
+                                print()
+                                ConsoleFormatter.success(
+                                    f"Hand complete! ({len(reader.current_cards)} cards)"
+                                )
+                                ConsoleFormatter.info(f"Hand: {', '.join(reader.get_hand())}", indent=3)
                         else:
-                            print(f"  ❌ Invalid card: '{input_buffer}' (not in 52 valid cards)")
+                            ConsoleFormatter.error(
+                                f"Invalid card: '{input_buffer}' (not in 52 valid cards)",
+                                indent=2
+                            )
                         
                         input_buffer = ""
                     continue
                 
                 # Handle special control characters
                 if ord(char) == 3:  # Ctrl+C
-                    print("\n\nExiting...")
+                    print("\n")
+                    ConsoleFormatter.info("Exiting...")
                     break
                 
                 if ord(char) == 4:  # Ctrl+D (EOF)
-                    print("\n\nExiting...")
+                    print("\n")
+                    ConsoleFormatter.info("Exiting...")
                     break
                 
                 # Handle Enter/Return key
@@ -207,15 +518,22 @@ def main():
                         card = reader.validate_card(input_buffer)
                         
                         if card:
-                            print(f"\n📥 Processed: '{input_buffer}' -> {card}")
+                            print()
+                            ConsoleFormatter.input_msg(f"Processed: '{input_buffer}' -> {card}")
                             reader.add_card(card)
                             
-                            if len(reader.current_hand) >= 2:
-                                print(f"\n✅ Hand complete! ({len(reader.current_hand)} unique cards)")
-                                print(f"   Hand: {', '.join(reader.get_hand())}")
-                                reader.store_hand()
+                            if len(reader.current_cards) >= 2:
+                                print()
+                                ConsoleFormatter.success(
+                                    f"Hand complete! ({len(reader.current_cards)} cards)"
+                                )
+                                ConsoleFormatter.info(f"Hand: {', '.join(reader.get_hand())}", indent=3)
                         else:
-                            print(f"\n  ❌ Invalid card: '{input_buffer}' (not in 52 valid cards)")
+                            print()
+                            ConsoleFormatter.error(
+                                f"Invalid card: '{input_buffer}' (not in 52 valid cards)",
+                                indent=2
+                            )
                         
                         input_buffer = ""
                 
@@ -223,26 +541,36 @@ def main():
                 elif ord(char) == 127 or ord(char) == 8:  # Backspace
                     if input_buffer:
                         input_buffer = input_buffer[:-1]
-                        print(f"📥 Backspace (buffer: '{input_buffer}')", end='\r')
+                        print(f"{ConsoleFormatter.PREFIX_INPUT}Backspace (buffer: '{input_buffer}')", end='\r')
                 
                 # Handle printable characters
                 elif char.isprintable():
-                    # Check for special commands first (only if buffer is empty)
-                    if not input_buffer:
+                    # Debug: show what character we received
+                    char_code = ord(char)
+                    
+                    # Check for special commands first (only if buffer is empty AND it's a letter)
+                    # Only accept commands if they're standalone letters (not part of card input)
+                    # Commands must be single letters: R, Q, or S
+                    if not input_buffer and char.isalpha():
                         if char.upper() == 'R':
                             print("\n")
+                            ConsoleFormatter.info("Reset command received")
                             reader.reset()
                             continue
                         elif char.upper() == 'Q':
-                            print("\n\n👋 Goodbye!")
+                            print("\n")
+                            ConsoleFormatter.info("Quit command received")
+                            ConsoleFormatter.success("Goodbye!")
                             break
                         elif char.upper() == 'S':
                             print("\n")
+                            ConsoleFormatter.info("Status command received")
                             reader.display_status()
                             continue
                     
+                    # Add character to buffer (for card input)
                     input_buffer += char
-                    print(f"📥 Char: '{char}' (buffer: '{input_buffer}')", end='\r')
+                    print(f"{ConsoleFormatter.PREFIX_INPUT}Char: '{char}' (code={char_code}) (buffer: '{input_buffer}')", end='\r')
                     
                     # If we have 2 or 3 characters, validate immediately
                     if len(input_buffer) >= 2:
@@ -250,19 +578,26 @@ def main():
                         
                         if card:
                             # Valid card found - process it
-                            print(f"\n📥 Processed: '{input_buffer}' -> {card}")
+                            print()
+                            ConsoleFormatter.input_msg(f"Processed: '{input_buffer}' -> {card}")
                             reader.add_card(card)
                             
                             # Check if we have at least 2 unique cards - store automatically
-                            if len(reader.current_hand) >= 2:
-                                print(f"\n✅ Hand complete! ({len(reader.current_hand)} unique cards)")
-                                print(f"   Hand: {', '.join(reader.get_hand())}")
-                                reader.store_hand()
+                            if len(reader.current_cards) >= 2:
+                                print()
+                                ConsoleFormatter.success(
+                                    f"Hand complete! ({len(reader.current_cards)} cards)"
+                                )
+                                ConsoleFormatter.info(f"Hand: {', '.join(reader.get_hand())}", indent=3)
                             
                             input_buffer = ""
                         elif len(input_buffer) == 3:
                             # 3 characters and still not valid - invalid card
-                            print(f"\n  ❌ Invalid card: '{input_buffer}' (not in 52 valid cards)")
+                            print()
+                            ConsoleFormatter.error(
+                                f"Invalid card: '{input_buffer}' (not in 52 valid cards)",
+                                indent=2
+                            )
                             input_buffer = ""
                 
             except KeyboardInterrupt:
@@ -276,16 +611,21 @@ def main():
     
     finally:
         # Restore terminal settings
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        
+        # Close serial if open
+        if ser is not None:
+            try:
+                if ser.is_open:
+                    ser.close()
+            except Exception:
+                pass
     
     # Display final summary
-    print("\n" + "=" * 60)
-    print("📊 Final Summary")
-    print("=" * 60)
+    ConsoleFormatter.header("Final Summary", "📊")
     reader.display_status()
     print()
 
 
 if __name__ == "__main__":
     main()
-
