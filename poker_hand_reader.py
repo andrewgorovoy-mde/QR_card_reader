@@ -476,28 +476,50 @@ def main():
                 
                 if char is None:
                     # Timeout - check if we should process the buffer
-                    if input_buffer and len(input_buffer) >= 2:
-                        # Process the accumulated characters
-                        card = reader.validate_card(input_buffer)
+                    if input_buffer:
+                        # Check for standalone commands (R, Q, S) - only if single character
+                        if len(input_buffer) == 1 and input_buffer.isalpha():
+                            cmd = input_buffer.upper()
+                            if cmd == 'R':
+                                print("\n")
+                                ConsoleFormatter.info("Reset command received")
+                                reader.reset()
+                                input_buffer = ""
+                                continue
+                            elif cmd == 'Q':
+                                print("\n")
+                                ConsoleFormatter.info("Quit command received")
+                                ConsoleFormatter.success("Goodbye!")
+                                break
+                            elif cmd == 'S':
+                                print("\n")
+                                ConsoleFormatter.info("Status command received")
+                                reader.display_status()
+                                input_buffer = ""
+                                continue
                         
-                        if card:
-                            ConsoleFormatter.input_msg(f"Processed: '{input_buffer}' -> {card}")
-                            reader.add_card(card)
+                        # Process as card if we have 2+ characters
+                        if len(input_buffer) >= 2:
+                            card = reader.validate_card(input_buffer)
                             
-                            # If at least 2 cards, hand is automatically sent to Arduino
-                            if len(reader.current_cards) >= 2:
-                                print()
-                                ConsoleFormatter.success(
-                                    f"Hand complete! ({len(reader.current_cards)} cards)"
+                            if card:
+                                ConsoleFormatter.input_msg(f"Processed: '{input_buffer}' -> {card}")
+                                reader.add_card(card)
+                                
+                                # If at least 2 cards, hand is automatically sent to Arduino
+                                if len(reader.current_cards) >= 2:
+                                    print()
+                                    ConsoleFormatter.success(
+                                        f"Hand complete! ({len(reader.current_cards)} cards)"
+                                    )
+                                    ConsoleFormatter.info(f"Hand: {', '.join(reader.get_hand())}", indent=3)
+                            else:
+                                ConsoleFormatter.error(
+                                    f"Invalid card: '{input_buffer}' (not in 52 valid cards)",
+                                    indent=2
                                 )
-                                ConsoleFormatter.info(f"Hand: {', '.join(reader.get_hand())}", indent=3)
-                        else:
-                            ConsoleFormatter.error(
-                                f"Invalid card: '{input_buffer}' (not in 52 valid cards)",
-                                indent=2
-                            )
-                        
-                        input_buffer = ""
+                            
+                            input_buffer = ""
                     continue
                 
                 # Handle special control characters
@@ -548,27 +570,7 @@ def main():
                     # Debug: show what character we received
                     char_code = ord(char)
                     
-                    # Check for special commands first (only if buffer is empty AND it's a letter)
-                    # Only accept commands if they're standalone letters (not part of card input)
-                    # Commands must be single letters: R, Q, or S
-                    if not input_buffer and char.isalpha():
-                        if char.upper() == 'R':
-                            print("\n")
-                            ConsoleFormatter.info("Reset command received")
-                            reader.reset()
-                            continue
-                        elif char.upper() == 'Q':
-                            print("\n")
-                            ConsoleFormatter.info("Quit command received")
-                            ConsoleFormatter.success("Goodbye!")
-                            break
-                        elif char.upper() == 'S':
-                            print("\n")
-                            ConsoleFormatter.info("Status command received")
-                            reader.display_status()
-                            continue
-                    
-                    # Add character to buffer (for card input)
+                    # Add character to buffer first (for card input)
                     input_buffer += char
                     print(f"{ConsoleFormatter.PREFIX_INPUT}Char: '{char}' (code={char_code}) (buffer: '{input_buffer}')", end='\r')
                     
