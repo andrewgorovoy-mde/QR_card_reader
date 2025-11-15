@@ -108,6 +108,7 @@ except ImportError:
 # Path to audio_out folder (same level as this script)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 AUDIO_DIR = os.path.join(SCRIPT_DIR, "audio_out")
+CARDS_FILE = os.path.join(SCRIPT_DIR, "detected_cards.txt")  # File to store detected cards
 
 
 def format_qr_data(data):
@@ -499,6 +500,12 @@ def main():
                 if card not in unique_qr_codes:
                     unique_qr_codes.add(card)
                     card_order.append(card)
+                    # Write new card to text file
+                    try:
+                        with open(CARDS_FILE, "a", encoding="utf-8") as f:
+                            f.write(f"{card}\n")
+                    except Exception as e:
+                        ConsoleFormatter.error(f"Failed to write card to file: {e}", indent=2)
 
             current_count = len(card_order)
 
@@ -768,6 +775,15 @@ def main():
                 turn_card = None
                 river_detected = False
                 river_card = None
+                # Clear the cards text file
+                try:
+                    if os.path.exists(CARDS_FILE):
+                        os.remove(CARDS_FILE)
+                        ConsoleFormatter.info("Cards file cleared", indent=3)
+                    else:
+                        ConsoleFormatter.info("Cards file does not exist (nothing to clear)", indent=3)
+                except Exception as e:
+                    ConsoleFormatter.error(f"Failed to clear cards file: {e}", indent=3)
                 ConsoleFormatter.header("HAND RESET", "🔄")
                 ConsoleFormatter.info("All cards cleared. Ready to detect a new hand...", indent=3)
                 ConsoleFormatter.separator()

@@ -12,6 +12,10 @@ Also sends messages to an Arduino over serial:
 And reads any Serial.println() output from the Arduino and prints it
 to this console with a [ARDUINO] prefix.
 
+When Arduino sends 'RIVER' over serial, reads cards from detected_cards.txt file
+(written by live_qr_detector.py) and plays audio files for those cards from the
+audio_out directory.
+
 Controls:
   R - Reset current hand (without storing)
   S - Show status
@@ -26,6 +30,9 @@ import select
 import time
 import platform
 import argparse
+import random
+import os
+import subprocess
 from typing import List, Optional
 
 # Try to import pyserial
@@ -49,7 +56,7 @@ SYSTEM = platform.system()  # 'Darwin' for macOS, 'Linux' for Pi
 
 if SYSTEM == "Darwin":
     # For your MKR WiFi 1010 on macOS
-    DEFAULT_SERIAL_PORT = "/dev/cu.usbmodem11401"
+    DEFAULT_SERIAL_PORT = "/dev/cu.usbmodem1101"
 elif SYSTEM == "Linux":
     # Typical Arduino device name on Raspberry Pi
     DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
@@ -57,6 +64,11 @@ else:
     DEFAULT_SERIAL_PORT = ""  # unknown OS, must pass --serial-port
 
 DEFAULT_BAUDRATE = 115200  # MKR WiFi 1010 is fine with 115200
+
+# Path to audio_out folder (same level as this script)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+AUDIO_DIR = os.path.join(SCRIPT_DIR, "audio_out")
+CARDS_FILE = os.path.join(SCRIPT_DIR, "detected_cards.txt")  # File to read cards from (written by live_qr_detector.py)
 
 
 # Console formatting helpers for uniform output
@@ -154,6 +166,143 @@ class ConsoleFormatter:
         """Print a bullet point."""
         spaces = " " * indent
         print(f"{spaces}• {msg}")
+
+
+# ---------- AUDIO HELPERS ---------- #
+
+def extract_card_code(card_str: str) -> str:
+    """
+    Extract a card code suitable for filename from the card string.
+    Examples:
+      "7H"         -> "7H"
+      "AS"         -> "AS"
+      "7H extra"   -> "7H"
+      "  as  "     -> "AS"
+    We take leading alphanumeric characters, uppercase them.
+    """
+    s = card_str.strip().upper()
+    code = ""
+    for ch in s:
+        if ch.isalnum():
+            code += ch
+        else:
+            break
+    return code
+
+
+def play_wav(path: str) -> bool:
+    """
+    Play a .wav file using platform-appropriate audio player.
+    - macOS: uses 'afplay'
+    - Linux/Raspberry Pi: uses 'aplay'
+    - Windows: uses 'start' command
+    This call is blocking: it waits until the audio finishes.
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    system = platform.system()
+    
+    try:
+        if system == "Darwin":  # macOS
+            subprocess.run(["afplay", path], check=True)
+        elif system == "Linux":
+            subprocess.run(["aplay", path], check=True)
+        elif system == "Windows":
+            subprocess.run(["start", "/WAIT", path], shell=True, check=True)
+        else:
+            ConsoleFormatter.warning(f"Unsupported OS '{system}'. Audio playback may not work.", indent=2)
+            return False
+        return True
+    except FileNotFoundError:
+        if system == "Darwin":
+            ConsoleFormatter.error("'afplay' not found. This is unusual on macOS.", indent=2)
+        elif system == "Linux":
+            ConsoleFormatter.error("'aplay' not found. Install ALSA utils with:", indent=2)
+            ConsoleFormatter.info("  sudo apt install alsa-utils", indent=3)
+        else:
+            ConsoleFormatter.error(f"Audio player not found for OS '{system}'", indent=2)
+        return False
+    except subprocess.CalledProcessError as e:
+        ConsoleFormatter.error(f"Error playing {path}: Command failed with return code {e.returncode}", indent=2)
+        return False
+    except Exception as e:
+        ConsoleFormatter.error(f"Error playing {path}: {e}", indent=2)
+        return False
+
+
+def read_cards_from_file() -> List[str]:
+    """
+    Read cards from the detected_cards.txt file (written by live_qr_detector.py).
+    
+    Returns:
+        List of card strings, empty list if file doesn't exist or is empty
+    """
+    if not os.path.exists(CARDS_FILE):
+        return []
+    
+    try:
+        with open(CARDS_FILE, "r", encoding="utf-8") as f:
+            cards = [line.strip() for line in f.readlines() if line.strip()]
+        return cards
+    except Exception as e:
+        ConsoleFormatter.error(f"Failed to read cards from file: {e}", indent=2)
+        return []
+
+
+def play_cards_audio(card_order: List[str]):
+    """
+    For each known card in card_order, play the corresponding audio file
+    from AUDIO_DIR. Files are expected to be named <card_code>.wav,
+    e.g. '7H.wav', 'AS.wav'.
+    
+    Args:
+        card_order: List of card strings (e.g., ["AS", "7H"])
+    """
+    if not card_order:
+        ConsoleFormatter.info("No cards to play audio for.", indent=2)
+        return
+
+    # Check if audio directory exists
+    if not os.path.exists(AUDIO_DIR):
+        ConsoleFormatter.warning(f"Audio directory not found: {AUDIO_DIR}", indent=2)
+        ConsoleFormatter.info("Creating directory...", indent=3)
+        try:
+            os.makedirs(AUDIO_DIR, exist_ok=True)
+            ConsoleFormatter.success(f"Directory created. Please add .wav files named like 'AS.wav', '7H.wav', etc.", indent=3)
+        except Exception as e:
+            ConsoleFormatter.error(f"Failed to create directory: {e}", indent=3)
+        return
+
+    ConsoleFormatter.info(f"Playing audio for cards (from {AUDIO_DIR}):", indent=2)
+    played_count = 0
+    for i, card in enumerate(card_order, 1):
+        code = extract_card_code(card)
+        if not code:
+            ConsoleFormatter.warning(f"'{card}' -> could not extract code, skipping.", indent=3)
+            continue
+
+        filename = f"{code}.wav"
+        filepath = os.path.join(AUDIO_DIR, filename)
+
+        if os.path.exists(filepath):
+            ConsoleFormatter.info(f"{i}. {card} -> Playing {filename}...", indent=3)
+            if play_wav(filepath):
+                ConsoleFormatter.success("✓", indent=5)
+                played_count += 1
+            else:
+                ConsoleFormatter.error("✗ Failed", indent=5)
+            time.sleep(0.01)  # minimal pause between cards (10ms)
+        else:
+            ConsoleFormatter.warning(f"{i}. {card} -> missing audio file: {filename}", indent=3)
+    
+    if played_count == 0:
+        ConsoleFormatter.warning("No audio files were played. Check that:", indent=2)
+        ConsoleFormatter.info(f"1. Audio files exist in: {AUDIO_DIR}", indent=3)
+        ConsoleFormatter.info(f"2. Files are named correctly (e.g., 'AS.wav', '7H.wav')", indent=3)
+    else:
+        ConsoleFormatter.success(f"Successfully played {played_count} audio file(s).", indent=2)
+    print()
 
 
 class PokerHandReader:
@@ -439,6 +588,210 @@ def get_char(timeout=0.1):
     return None
 
 
+def show_test_menu():
+    """Display ASCII menu for test mode."""
+    ConsoleFormatter.header("TEST MODE MENU", "🧪")
+    print()
+    print("  [1] Generate and send random hand")
+    print("  [2] Generate and send N random hands")
+    print("  [3] Auto-generate hands (continuous)")
+    print("  [4] Send reset command (R)")
+    print("  [5] Show current status")
+    print("  [Q] Quit test mode")
+    print()
+    ConsoleFormatter.separator()
+
+
+def generate_random_hand() -> List[str]:
+    """
+    Generate a random poker hand (2 unique cards).
+    
+    Returns:
+        List of 2 card strings (e.g., ["AS", "7H"])
+    """
+    cards = list(PokerHandReader.VALID_CARDS)
+    hand = random.sample(cards, 2)
+    return hand
+
+
+def run_test_mode(reader: PokerHandReader, ser=None):
+    """
+    Run test mode with interactive menu.
+    
+    Args:
+        reader: PokerHandReader instance
+        ser: Serial connection (optional)
+    """
+    # Ensure reader has serial connection
+    if ser is not None:
+        reader.serial = ser
+    
+    ConsoleFormatter.header("TEST MODE ACTIVATED", "🧪")
+    ConsoleFormatter.info("Test mode allows you to generate random hands", indent=2)
+    ConsoleFormatter.info("and send them in the expected format to Arduino", indent=2)
+    if reader.serial is not None:
+        ConsoleFormatter.success("Serial connection active - hands will be sent to Arduino", indent=2)
+    else:
+        ConsoleFormatter.warning("No serial connection - hands will be displayed but not sent", indent=2)
+    print()
+    
+    auto_mode = False
+    auto_interval = 2.0  # seconds between auto-generated hands
+    
+    try:
+        while True:
+            if not auto_mode:
+                show_test_menu()
+                ConsoleFormatter.input_msg("Enter choice: ", indent=0)
+                try:
+                    choice = input().strip().upper()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    ConsoleFormatter.info("Exiting test mode...", indent=2)
+                    break
+            else:
+                # Auto mode - generate hand automatically
+                choice = '1'
+                try:
+                    time.sleep(auto_interval)
+                except KeyboardInterrupt:
+                    print()
+                    auto_mode = False
+                    ConsoleFormatter.info("Auto mode stopped by user", indent=2)
+                    print()
+                    continue
+            
+            if choice == '1':
+                # Generate and send one random hand
+                hand = generate_random_hand()
+                ConsoleFormatter.info(f"Generated random hand: {', '.join(hand)}", indent=2)
+                
+                # Simulate adding cards to reader
+                reader.current_cards.clear()
+                reader.card_count = 0
+                for card in hand:
+                    reader.add_card(card)
+                
+                # Send to Arduino if connected
+                if reader.serial is not None:
+                    success = reader.send_hand_to_arduino(hand)
+                    if success:
+                        ConsoleFormatter.success("Hand sent successfully!", indent=2)
+                    else:
+                        ConsoleFormatter.warning("Failed to send hand (serial may be disconnected)", indent=2)
+                else:
+                    # Show what would be sent
+                    card1_list = reader.card_to_list(hand[0])
+                    card2_list = reader.card_to_list(hand[1])
+                    hand_list = card1_list + card2_list
+                    hand_str = ",".join(hand_list)
+                    ConsoleFormatter.info(f"Would send: HAND:{hand_str}", indent=2)
+                    ConsoleFormatter.warning("Serial not connected - data not sent", indent=2)
+                
+                print()
+                
+            elif choice == '2':
+                # Generate N random hands
+                ConsoleFormatter.input_msg("How many hands to generate? ", indent=0)
+                try:
+                    n = int(input().strip())
+                    if n < 1:
+                        ConsoleFormatter.error("Please enter a positive number", indent=2)
+                        continue
+                except ValueError:
+                    ConsoleFormatter.error("Invalid number", indent=2)
+                    continue
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    ConsoleFormatter.info("Cancelled", indent=2)
+                    continue
+                
+                ConsoleFormatter.info(f"Generating {n} random hands...", indent=2)
+                print()
+                
+                try:
+                    for i in range(n):
+                        hand = generate_random_hand()
+                        ConsoleFormatter.info(f"Hand {i+1}/{n}: {', '.join(hand)}", indent=2)
+                        
+                        # Simulate adding cards
+                        reader.current_cards.clear()
+                        reader.card_count = 0
+                        for card in hand:
+                            reader.add_card(card)
+                        
+                        # Send to Arduino if connected
+                        if reader.serial is not None:
+                            success = reader.send_hand_to_arduino(hand)
+                            if success:
+                                ConsoleFormatter.success("Sent!", indent=4)
+                            else:
+                                ConsoleFormatter.warning("Send failed", indent=4)
+                        else:
+                            card1_list = reader.card_to_list(hand[0])
+                            card2_list = reader.card_to_list(hand[1])
+                            hand_list = card1_list + card2_list
+                            hand_str = ",".join(hand_list)
+                            ConsoleFormatter.info(f"Would send: HAND:{hand_str}", indent=4)
+                        
+                        if i < n - 1:
+                            time.sleep(0.5)  # Small delay between hands
+                        print()
+                except KeyboardInterrupt:
+                    print()
+                    ConsoleFormatter.info("Interrupted by user", indent=2)
+                    print()
+            
+            elif choice == '3':
+                # Toggle auto mode
+                auto_mode = not auto_mode
+                if auto_mode:
+                    ConsoleFormatter.info("Auto mode ENABLED", indent=2)
+                    ConsoleFormatter.info(f"Generating hands every {auto_interval} seconds", indent=2)
+                    ConsoleFormatter.info("Press Ctrl+C to stop", indent=2)
+                    print()
+                else:
+                    ConsoleFormatter.info("Auto mode DISABLED", indent=2)
+                    print()
+            
+            elif choice == '4':
+                # Send reset command
+                ConsoleFormatter.info("Sending reset command (R) to Arduino...", indent=2)
+                reader.reset()
+                print()
+            
+            elif choice == '5':
+                # Show status
+                reader.display_status()
+                print()
+            
+            elif choice == 'Q':
+                ConsoleFormatter.info("Exiting test mode...", indent=2)
+                break
+                
+            else:
+                ConsoleFormatter.error(f"Invalid choice: '{choice}'", indent=2)
+                print()
+    
+    except KeyboardInterrupt:
+        print()
+        ConsoleFormatter.info("Test mode interrupted by user", indent=2)
+
+
+def show_startup_menu():
+    """Display startup menu to choose between normal and test mode."""
+    ConsoleFormatter.header("POKER HAND READER", "🎴")
+    print()
+    print("  [1] Normal Mode (read from QR scanner)")
+    print("  [2] Test Mode (generate random hands)")
+    print("  [Q] Quit")
+    print()
+    ConsoleFormatter.separator()
+    ConsoleFormatter.input_msg("Select mode: ", indent=0)
+    choice = input().strip().upper()
+    return choice
+
+
 def main():
     """Main function to run the poker hand reader."""
     parser = argparse.ArgumentParser(description="Poker Hand Reader with Arduino output")
@@ -453,6 +806,11 @@ def main():
         type=int,
         default=DEFAULT_BAUDRATE,
         help=f"Serial baudrate (default: {DEFAULT_BAUDRATE})",
+    )
+    parser.add_argument(
+        "--test-mode",
+        action="store_true",
+        help="Skip menu and go directly to test mode",
     )
     args = parser.parse_args()
 
@@ -505,7 +863,25 @@ def main():
     # Initial connection attempt
     attempt_serial_connect(force=True)
     
-    # Save terminal settings
+    # Show startup menu unless --test-mode flag is used
+    if args.test_mode:
+        # Direct test mode
+        run_test_mode(reader, ser)
+        return
+    else:
+        mode_choice = show_startup_menu()
+        if mode_choice == 'Q':
+            ConsoleFormatter.info("Goodbye!")
+            return
+        elif mode_choice == '2':
+            # Test mode selected
+            run_test_mode(reader, ser)
+            return
+        elif mode_choice != '1':
+            ConsoleFormatter.error("Invalid choice. Exiting.")
+            return
+    
+    # Normal mode - save terminal settings
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     
@@ -554,6 +930,22 @@ def main():
                             line = ser.readline().decode("utf-8", errors="replace").rstrip()
                             if line:
                                 ConsoleFormatter.arduino(line)
+                                
+                                # Check if Arduino sent 'RIVER' command to trigger audio playback
+                                if line.upper().strip() == "RIVER":
+                                    print()
+                                    ConsoleFormatter.header("RIVER DETECTED", "🎵")
+                                    ConsoleFormatter.success("RIVER command received from Arduino", indent=2)
+                                    ConsoleFormatter.info("Reading cards from file and playing audio...", indent=2)
+                                    # Read cards from the file written by live_qr_detector.py
+                                    current_cards = read_cards_from_file()
+                                    if current_cards:
+                                        ConsoleFormatter.info(f"Cards from file: {', '.join(current_cards)}", indent=3)
+                                        play_cards_audio(current_cards)
+                                    else:
+                                        ConsoleFormatter.warning("No cards found in file. Make sure live_qr_detector.py is running and has detected cards.", indent=2)
+                                    ConsoleFormatter.separator()
+                                    print()
                     except (OSError, SerialExceptionType) as e:
                         ConsoleFormatter.error(
                             f"Serial I/O error talking to Arduino: {e}. "
