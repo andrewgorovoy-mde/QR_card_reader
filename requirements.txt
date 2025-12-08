@@ -1,0 +1,4 @@
+opencv-python>=4.8.0
+numpy>=1.24.0
+pyrealsense2>=2.54.0  # Optional: For Intel RealSense D435 camera support
+
